@@ -186,34 +186,58 @@ class PlaylistManager:
 
 # ─── PLAYER ───────────────────────────────────────────────────────────────────
 class NijiPlayer:
-    def __init__(self, resolver: YtDlpResolver, playlist: PlaylistManager, stats: ResolutionStats):
+    def __init__(self, resolver: YtDlpResolver, playlist: PlaylistManager,
+                 stats: ResolutionStats, niji_mode: bool = False):
         Gst.init(None)
-        self.resolver  = resolver
-        self.playlist  = playlist
-        self.stats     = stats
-        self.loop      = GLib.MainLoop()
-        self.pipeline  = None
-        self._paused   = False
-        self._volume   = 1.0
-        self._loading  = False
+        self.resolver   = resolver
+        self.playlist   = playlist
+        self.stats      = stats
+        self._niji_mode = niji_mode
+        self.loop       = GLib.MainLoop()
+        self.pipeline   = None
+        self._paused    = False
+        self._volume    = 1.0
+        self._loading   = False
         # Metadata del track actual
         self._current_title    = "N/A"
         self._current_quality  = "?"
         self._current_duration = "?"
         # Pre-carga del siguiente video
-        self._prefetch_info: dict | None = None   # stream_info ya resuelto
-        self._prefetch_url:  str  | None = None   # yt URL al que corresponde
+        self._prefetch_info: dict | None = None
+        self._prefetch_url:  str  | None = None
         self._prefetch_lock  = threading.Lock()
+        # Seek con debounce (acumula offsets, ejecuta un solo seek)
+        self._seek_pending: float = 0.0
+        self._seek_timer:   threading.Timer | None = None
+        self._seek_lock     = threading.Lock()
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
     def _build_pipeline(self, stream_url: str) -> Gst.Pipeline:
         pipeline = Gst.ElementFactory.make("playbin", "player")
         pipeline.set_property("uri", stream_url)
         pipeline.set_property("volume", self._volume)
-        # Albireo: auto sinks (X11 + PulseAudio)
-        # Niji:    kmssink sync=true + alsasink sync=true
-        pipeline.set_property("video-sink", Gst.ElementFactory.make("autovideosink", "vsink"))
-        pipeline.set_property("audio-sink", Gst.ElementFactory.make("autoaudiosink", "asink"))
+        if self._niji_mode:
+            # Niji: headless HDMI via KMS + audio via ALSA
+            vsink = Gst.ElementFactory.make("kmssink",  "vsink")
+            asink = Gst.ElementFactory.make("alsasink", "asink")
+            if vsink is None:
+                raise RuntimeError("Plugin 'kmssink' no encontrado. Instala: gstreamer1.0-plugins-bad")
+            if asink is None:
+                raise RuntimeError("Plugin 'alsasink' no encontrado. Instala: gstreamer1.0-alsa")
+            vsink.set_property("sync", True)
+            asink.set_property("sync", True)
+            log.info("Pipeline: kmssink + alsasink (modo Niji)")
+        else:
+            # Albireo: X11/Wayland + PulseAudio
+            vsink = Gst.ElementFactory.make("autovideosink", "vsink")
+            asink = Gst.ElementFactory.make("autoaudiosink", "asink")
+            if vsink is None:
+                raise RuntimeError("Plugin 'autovideosink' no encontrado. Instala: gstreamer1.0-plugins-good")
+            if asink is None:
+                raise RuntimeError("Plugin 'autoaudiosink' no encontrado. Instala: gstreamer1.0-plugins-good")
+            log.info("Pipeline: autovideosink + autoaudiosink (modo Albireo)")
+        pipeline.set_property("video-sink", vsink)
+        pipeline.set_property("audio-sink", asink)
         return pipeline
 
     def _stop_pipeline(self):
@@ -347,23 +371,38 @@ class NijiPlayer:
         log.info("▶→⏸ Pause")
         return "OK: Pausado"
 
-    def cmd_seek(self, seconds: float) -> str:
-        if not self.pipeline:
-            return "ERROR: No hay nada reproduciéndose"
+    def _execute_seek(self):
+        """Ejecuta el seek acumulado (llamado por el timer de debounce)."""
+        with self._seek_lock:
+            offset = self._seek_pending
+            self._seek_pending = 0.0
+            self._seek_timer   = None
+        if not self.pipeline or offset == 0:
+            return
         ok, pos_ns = self.pipeline.query_position(Gst.Format.TIME)
-        if not ok:
-            return "ERROR: No se pudo obtener posición"
-        new_pos = max(0, pos_ns + int(seconds * Gst.SECOND))
-        success = self.pipeline.seek_simple(
+        # Si la posición no está lista (inicio del stream), usar 0
+        base = pos_ns if (ok and pos_ns > 0) else 0
+        new_pos = max(0, base + int(offset * Gst.SECOND))
+        self.pipeline.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
             new_pos
         )
+        s = new_pos // Gst.SECOND
+        log.info(f"⏩ Seek ejecutado: {offset:+.0f}s → {s//60}:{s%60:02d}")
+
+    def cmd_seek(self, seconds: float) -> str:
+        """Acumula el offset y dispara el seek con debounce de 300ms."""
+        if not self.pipeline:
+            return "ERROR: No hay nada reproduciéndose"
+        with self._seek_lock:
+            self._seek_pending += seconds
+            if self._seek_timer:
+                self._seek_timer.cancel()
+            self._seek_timer = threading.Timer(0.3, self._execute_seek)
+            self._seek_timer.start()
         direction = "adelante" if seconds > 0 else "atrás"
-        if success:
-            log.info(f"⏩ Seek {abs(int(seconds))}s {direction}")
-            return f"OK: {abs(int(seconds))}s {direction}"
-        return "ERROR: Seek falló"
+        return f"OK: {abs(int(seconds))}s {direction}"
 
     def cmd_next(self) -> str:
         if self._loading:
@@ -465,8 +504,12 @@ class ControlServer:
             cmd   = parts[0]
 
             if   cmd == "pause":  response = self.player.cmd_pause_resume()
-            elif cmd == "ff":     response = self.player.cmd_seek(+SEEK_SECONDS)
-            elif cmd == "rw":     response = self.player.cmd_seek(-SEEK_SECONDS)
+            elif cmd == "ff":
+                secs = float(parts[1]) if len(parts) > 1 else SEEK_SECONDS
+                response = self.player.cmd_seek(+secs)
+            elif cmd == "rw":
+                secs = float(parts[1]) if len(parts) > 1 else SEEK_SECONDS
+                response = self.player.cmd_seek(-secs)
             elif cmd == "next":   response = self.player.cmd_next()
             elif cmd == "prev":   response = self.player.cmd_prev()
             elif cmd == "stop":   response = self.player.cmd_stop()
@@ -524,13 +567,19 @@ def main():
         print("  status | pause | ff | rw | next | prev | vol <n> | stop | stats")
         sys.exit(1)
 
-    is_mix = "--mix" in sys.argv
-    url    = sys.argv[-1]
+    is_mix    = "--mix"  in sys.argv
+    niji_mode = "--niji" in sys.argv
+    url       = sys.argv[-1]
+
+    if niji_mode:
+        log.info("Modo: Niji (kmssink + alsasink)")
+    else:
+        log.info("Modo: Albireo (autovideosink + autoaudiosink)")
 
     stats    = ResolutionStats()
     resolver = YtDlpResolver(COOKIES_PATH, stats)
     playlist = PlaylistManager()
-    player   = NijiPlayer(resolver, playlist, stats)
+    player   = NijiPlayer(resolver, playlist, stats, niji_mode=niji_mode)
 
     ctrl = ControlServer(player)
     ctrl.start()

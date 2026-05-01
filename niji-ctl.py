@@ -7,8 +7,8 @@ Uso:
 Comandos:
     status          → Estado actual (título, calidad, posición, volumen)
     pause           → Pausa / Reanuda
-    ff              → Adelantar 5 segundos
-    rw              → Retroceder 5 segundos
+    ff [n]          → Adelantar n segundos (default: 5). Ej: ff 10
+    rw [n]          → Retroceder n segundos (default: 5). Ej: rw 10
     next            → Siguiente video
     prev            → Video anterior
     stop            → Detiene y cierra el player
