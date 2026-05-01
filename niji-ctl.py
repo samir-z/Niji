@@ -5,12 +5,15 @@ Uso:
     python3 niji-ctl.py <comando> [args]
 
 Comandos:
-    status          → Estado actual (título, track, volumen)
+    status          → Estado actual (título, calidad, posición, volumen)
     pause           → Pausa / Reanuda
+    ff              → Adelantar 5 segundos
+    rw              → Retroceder 5 segundos
     next            → Siguiente video
     prev            → Video anterior
-    stop            → Detiene la reproducción
+    stop            → Detiene y cierra el player
     vol <0-100>     → Ajusta el volumen (ej: vol 80)
+    stats           → Tiempos de resolución de URL (cronómetro)
 """
 
 import socket
