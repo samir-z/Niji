@@ -1,0 +1,7 @@
+# Cookies — contienen tokens de sesión privados
+www.youtube.com_cookies.txt
+*.txt
+# Sockets y temporales
+/tmp/niji.sock
+__pycache__/
+*.pyc
