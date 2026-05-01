@@ -87,7 +87,7 @@ class YtDlpResolver:
         ]
         t0 = time.monotonic()
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             elapsed = time.monotonic() - t0
             if result.returncode == 0 and result.stdout.strip():
                 parts = result.stdout.strip().split("\n")[0].split("\t", 3)
@@ -101,7 +101,7 @@ class YtDlpResolver:
             log.error(f"yt-dlp error: {result.stderr.strip()}")
             return None
         except subprocess.TimeoutExpired:
-            log.error("yt-dlp timeout (60s)")
+            log.error("yt-dlp timeout (120s)")
             return None
         except Exception as e:
             log.error(f"yt-dlp excepción: {e}")
@@ -210,6 +210,7 @@ class NijiPlayer:
         self._seek_pending: float = 0.0
         self._seek_timer:   threading.Timer | None = None
         self._seek_lock     = threading.Lock()
+        self._last_seek_time: float = 0.0  # para no auto-skipear en error post-seek
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
     def _build_pipeline(self, stream_url: str) -> Gst.Pipeline:
@@ -248,7 +249,10 @@ class NijiPlayer:
 
     # ── Pre-carga ─────────────────────────────────────────────────────────────
     def _prefetch_next(self):
-        """Resuelve en background el URL del siguiente video de la queue."""
+        """Resuelve en background el URL del siguiente video.
+        Espera 15s antes de empezar para no competir con el pipeline en su inicio.
+        Reintenta una vez si falla (timeout por carga de CPU).
+        """
         next_item = self.playlist.peek_next()
         if not next_item:
             return
@@ -256,13 +260,23 @@ class NijiPlayer:
         with self._prefetch_lock:
             if self._prefetch_url == yt_url and self._prefetch_info:
                 return   # ya está en caché
+        # Esperar a que el pipeline GStreamer se estabilice (buffering inicial)
+        # Evita competencia de CPU cuando Node.js + ffmpeg + GStreamer corren juntos
+        time.sleep(15)
         log.info(f"⏳ Pre-cargando: {next_item['title']}")
         info = self.resolver.get_stream_info(yt_url)
+        if not info:
+            # Reintento único después de 5s (puede haber sido timeout por carga puntual)
+            log.warning("Pre-carga falló, reintentando en 5s...")
+            time.sleep(5)
+            info = self.resolver.get_stream_info(yt_url)
         with self._prefetch_lock:
             self._prefetch_url  = yt_url
             self._prefetch_info = info
         if info:
-            log.info(f"✅ Pre-carga lista: {info['title']}")
+            log.info(f"⚡ Pre-carga lista: {info['title']}")
+        else:
+            log.warning(f"Pre-carga falló definitivamente: {next_item['title']} (se resolverá al reproducir)")
 
     def _consume_prefetch(self, yt_url: str) -> dict | None:
         """Devuelve el stream_info pre-cargado si coincide con la URL pedida."""
@@ -284,6 +298,11 @@ class NijiPlayer:
         elif t == Gst.MessageType.ERROR:
             err, _ = message.parse_error()
             log.error(f"GStreamer ERROR: {err.message}")
+            # Guard: si el error ocurre <3s despues de un seek, es del buffer pool
+            # de kmssink al seekear HLS. No skipear al siguiente video.
+            if time.monotonic() - self._last_seek_time < 3.0:
+                log.warning("Error post-seek suprimido (kmssink buffer pool)")
+                return
             self._next_or_stop()
         elif t == Gst.MessageType.WARNING:
             warn, _ = message.parse_warning()
@@ -372,7 +391,10 @@ class NijiPlayer:
         return "OK: Pausado"
 
     def _execute_seek(self):
-        """Ejecuta el seek acumulado (llamado por el timer de debounce)."""
+        """Ejecuta el seek acumulado.
+        Pausa antes de seekear: kmssink no re-aloca buffer pool en PAUSED,
+        evitando el 'failed to activate buffer pool' en streams HLS.
+        """
         with self._seek_lock:
             offset = self._seek_pending
             self._seek_pending = 0.0
@@ -380,16 +402,22 @@ class NijiPlayer:
         if not self.pipeline or offset == 0:
             return
         ok, pos_ns = self.pipeline.query_position(Gst.Format.TIME)
-        # Si la posición no está lista (inicio del stream), usar 0
-        base = pos_ns if (ok and pos_ns > 0) else 0
+        base    = pos_ns if (ok and pos_ns > 0) else 0
         new_pos = max(0, base + int(offset * Gst.SECOND))
+        # Pausa → seek → reanuda (evita buffer pool failure en kmssink + HLS)
+        was_playing = not self._paused
+        if was_playing:
+            self.pipeline.set_state(Gst.State.PAUSED)
+            self.pipeline.get_state(Gst.SECOND * 2)  # esperar PAUSED confirmado
         self.pipeline.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
             new_pos
         )
+        if was_playing:
+            self.pipeline.set_state(Gst.State.PLAYING)
         s = new_pos // Gst.SECOND
-        log.info(f"⏩ Seek ejecutado: {offset:+.0f}s → {s//60}:{s%60:02d}")
+        log.info(f"⏩ Seek: {offset:+.0f}s → {s//60}:{s%60:02d}")
 
     def cmd_seek(self, seconds: float) -> str:
         """Acumula el offset y dispara el seek con debounce de 300ms."""
@@ -401,6 +429,7 @@ class NijiPlayer:
                 self._seek_timer.cancel()
             self._seek_timer = threading.Timer(0.3, self._execute_seek)
             self._seek_timer.start()
+        self._last_seek_time = time.monotonic()
         direction = "adelante" if seconds > 0 else "atrás"
         return f"OK: {abs(int(seconds))}s {direction}"
 
